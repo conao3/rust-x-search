@@ -23,6 +23,9 @@ const XAI_OAUTH_SCOPE: &str = "openid profile email offline_access grok-cli:acce
 const XAI_OAUTH_REDIRECT_HOST: &str = "127.0.0.1";
 const XAI_OAUTH_REDIRECT_PORT: u16 = 56121;
 const XAI_OAUTH_REDIRECT_PATH: &str = "/callback";
+const DEFAULT_CONFIG_SUBDIR: &str = "x-search";
+const AUTH_FILE_NAME: &str = "auth.json";
+const AUTH_STORE_VERSION: u64 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "x-search")]
@@ -45,7 +48,7 @@ struct Args {
     #[arg(long)]
     base_url: Option<String>,
 
-    /// Authentication source. auto uses XAI_API_KEY first, then Hermes xAI OAuth.
+    /// Authentication source. auto uses XAI_API_KEY first, then xAI OAuth.
     #[arg(long, value_enum, default_value_t = AuthMode::Auto)]
     auth: AuthMode,
 
@@ -53,9 +56,10 @@ struct Args {
     #[arg(long, default_value = "XAI_API_KEY")]
     api_key_env: String,
 
-    /// Hermes home directory that contains auth.json. Defaults to HERMES_HOME or ~/.hermes.
-    #[arg(long, env = "HERMES_HOME", global = true)]
-    hermes_home: Option<PathBuf>,
+    /// Directory that stores auth.json. Defaults to X_SEARCH_CONFIG_DIR,
+    /// XDG_CONFIG_HOME/x-search, or ~/.config/x-search.
+    #[arg(long, env = "X_SEARCH_CONFIG_DIR", global = true)]
+    config_dir: Option<PathBuf>,
 
     /// Restrict X Search to these handles. Repeat or comma-separate values.
     #[arg(long = "allow-handle", short = 'a', value_delimiter = ',')]
@@ -99,18 +103,18 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Manage xAI OAuth credentials compatible with Hermes auth.json.
+    /// Manage xAI OAuth credentials stored in the x-search auth store.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
     },
-    /// Sign in to xAI Grok OAuth and store credentials in Hermes auth.json.
+    /// Sign in to xAI Grok OAuth and store credentials in the x-search auth store.
     Login(LoginArgs),
 }
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    /// Sign in to xAI Grok OAuth and store credentials in Hermes auth.json.
+    /// Sign in to xAI Grok OAuth and store credentials in the x-search auth store.
     Login(LoginArgs),
     /// Show whether xAI OAuth credentials are stored without printing tokens.
     Status,
@@ -135,7 +139,7 @@ struct LoginArgs {
 enum AuthMode {
     Auto,
     ApiKey,
-    HermesOauth,
+    Oauth,
 }
 
 #[derive(Debug)]
@@ -357,7 +361,7 @@ async fn login_xai_oauth(
     println!();
     println!("Login successful!");
     println!("auth_file: {}", auth_file.display());
-    println!("Tokens were saved under providers.xai-oauth without printing them.");
+    println!("Tokens were saved without printing them.");
     Ok(())
 }
 
@@ -553,29 +557,14 @@ fn save_xai_oauth_login(
         .lock_exclusive()
         .with_context(|| format!("failed to lock {}", lock_path.display()))?;
 
-    let mut auth_store = if auth_file.exists() {
-        read_auth_store(auth_file)?
-    } else {
-        json!({ "version": 1, "providers": {} })
-    };
-    if !auth_store.is_object() {
-        auth_store = json!({ "version": 1, "providers": {} });
-    }
-    if auth_store
-        .get("providers")
-        .and_then(Value::as_object)
-        .is_none()
-    {
-        auth_store["providers"] = json!({});
-    }
-
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    auth_store["version"] = json!(1);
-    auth_store["active_provider"] = json!("xai-oauth");
-    auth_store["updated_at"] = json!(now.clone());
-    auth_store["providers"]["xai-oauth"] = json!({
-        "auth_mode": "oauth_pkce",
+    let auth_store = json!({
+        "version": AUTH_STORE_VERSION,
+        "updated_at": now,
         "last_refresh": now,
+        "auth_mode": "oauth_pkce",
+        "redirect_uri": redirect_uri,
+        "discovery": discovery,
         "tokens": {
             "access_token": token_payload.get("access_token").cloned().unwrap_or(Value::Null),
             "refresh_token": token_payload.get("refresh_token").cloned().unwrap_or(Value::Null),
@@ -583,8 +572,6 @@ fn save_xai_oauth_login(
             "expires_in": token_payload.get("expires_in").cloned().unwrap_or(Value::Null),
             "token_type": token_payload.get("token_type").cloned().unwrap_or_else(|| json!("Bearer")),
         },
-        "discovery": discovery,
-        "redirect_uri": redirect_uri,
     });
     write_auth_store(auth_file, &auth_store)?;
     Ok(())
@@ -613,12 +600,12 @@ async fn resolve_runtime_credentials(
 ) -> Result<RuntimeCredentials> {
     match args.auth {
         AuthMode::ApiKey => resolve_api_key_credentials(args),
-        AuthMode::HermesOauth => resolve_hermes_oauth_credentials(args, client).await,
+        AuthMode::Oauth => resolve_oauth_credentials(args, client).await,
         AuthMode::Auto => {
             if std::env::var_os(&args.api_key_env).is_some() {
                 resolve_api_key_credentials(args)
             } else {
-                resolve_hermes_oauth_credentials(args, client).await
+                resolve_oauth_credentials(args, client).await
             }
         }
     }
@@ -633,7 +620,7 @@ fn resolve_api_key_credentials(args: &Args) -> Result<RuntimeCredentials> {
     })
 }
 
-async fn resolve_hermes_oauth_credentials(
+async fn resolve_oauth_credentials(
     args: &Args,
     client: &reqwest::Client,
 ) -> Result<RuntimeCredentials> {
@@ -642,7 +629,7 @@ async fn resolve_hermes_oauth_credentials(
     let access_token = xai_access_token(&auth_store)?;
 
     if access_token_is_expiring(&access_token, XAI_REFRESH_SKEW_SECONDS) {
-        refresh_hermes_xai_oauth_tokens(&auth_file, client).await?;
+        refresh_xai_oauth_tokens(&auth_file, client).await?;
     }
 
     let auth_store = read_auth_store(&auth_file)?;
@@ -652,7 +639,7 @@ async fn resolve_hermes_oauth_credentials(
     })
 }
 
-async fn refresh_hermes_xai_oauth_tokens(auth_file: &Path, client: &reqwest::Client) -> Result<()> {
+async fn refresh_xai_oauth_tokens(auth_file: &Path, client: &reqwest::Client) -> Result<()> {
     let lock_path = auth_file.with_extension("lock");
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)
@@ -704,11 +691,14 @@ async fn refresh_hermes_xai_oauth_tokens(auth_file: &Path, client: &reqwest::Cli
         bail!("xAI OAuth token refresh failed with {status}");
     }
 
-    let provider = xai_provider_mut(&mut auth_store)?;
-    let tokens = provider
-        .get_mut("tokens")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("Hermes xAI OAuth state is missing tokens"))?;
+    let root = auth_store
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("auth store is not a JSON object"))?;
+    let tokens = root
+        .entry("tokens".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("auth store tokens field is not a JSON object"))?;
     let refreshed_access_token = value
         .get("access_token")
         .and_then(Value::as_str)
@@ -733,12 +723,12 @@ async fn refresh_hermes_xai_oauth_tokens(auth_file: &Path, client: &reqwest::Cli
     }
 
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    provider.insert("last_refresh".to_string(), json!(now.clone()));
-    provider.insert("auth_mode".to_string(), json!("oauth_pkce"));
-    provider
-        .entry("discovery".to_string())
+    root.insert("last_refresh".to_string(), json!(now.clone()));
+    root.insert("auth_mode".to_string(), json!("oauth_pkce"));
+    root.entry("discovery".to_string())
         .or_insert_with(|| json!({ "token_endpoint": token_endpoint }));
-    auth_store["updated_at"] = json!(now);
+    root.insert("updated_at".to_string(), json!(now));
+    root.insert("version".to_string(), json!(AUTH_STORE_VERSION));
 
     write_auth_store(auth_file, &auth_store)?;
     Ok(())
@@ -746,7 +736,7 @@ async fn refresh_hermes_xai_oauth_tokens(auth_file: &Path, client: &reqwest::Cli
 
 async fn token_endpoint(auth_store: &Value, client: &reqwest::Client) -> Result<String> {
     if let Some(endpoint) = auth_store
-        .pointer("/providers/xai-oauth/discovery/token_endpoint")
+        .pointer("/discovery/token_endpoint")
         .and_then(Value::as_str)
         .filter(|endpoint| !endpoint.trim().is_empty())
     {
@@ -782,12 +772,6 @@ fn selected_base_url(args: &Args) -> String {
         .filter(|value| !value.is_empty())
         .map(|value| value.trim_end_matches('/').to_string())
         .or_else(|| {
-            std::env::var("HERMES_XAI_BASE_URL")
-                .ok()
-                .map(|value| value.trim().trim_end_matches('/').to_string())
-                .filter(|value| !value.is_empty())
-        })
-        .or_else(|| {
             std::env::var("XAI_BASE_URL")
                 .ok()
                 .map(|value| value.trim().trim_end_matches('/').to_string())
@@ -797,27 +781,47 @@ fn selected_base_url(args: &Args) -> String {
 }
 
 fn auth_file_path(args: &Args) -> Result<PathBuf> {
-    let hermes_home = args
-        .hermes_home
+    let config_dir = args
+        .config_dir
         .clone()
-        .or_else(|| std::env::var_os("HERMES_HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".hermes")))
+        .or_else(|| {
+            std::env::var_os("X_SEARCH_CONFIG_DIR")
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+        })
+        .or_else(default_config_dir)
         .ok_or_else(|| {
-            anyhow!("could not resolve Hermes home; set --hermes-home or HERMES_HOME")
+            anyhow!(
+                "could not resolve x-search config dir; set --config-dir or X_SEARCH_CONFIG_DIR"
+            )
         })?;
-    Ok(hermes_home.join("auth.json"))
+    Ok(config_dir.join(AUTH_FILE_NAME))
+}
+
+fn default_config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let xdg = PathBuf::from(xdg);
+        if !xdg.as_os_str().is_empty() {
+            return Some(xdg.join(DEFAULT_CONFIG_SUBDIR));
+        }
+    }
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join(DEFAULT_CONFIG_SUBDIR)
+    })
 }
 
 fn read_auth_store(auth_file: &Path) -> Result<Value> {
     let text = fs::read_to_string(auth_file).with_context(|| {
         format!(
-            "failed to read Hermes auth store at {}",
+            "failed to read x-search auth store at {}",
             auth_file.display()
         )
     })?;
     serde_json::from_str(&text).with_context(|| {
         format!(
-            "failed to parse Hermes auth store at {}",
+            "failed to parse x-search auth store at {}",
             auth_file.display()
         )
     })
@@ -830,7 +834,7 @@ fn write_auth_store(auth_file: &Path, auth_store: &Value) -> Result<()> {
         auth_file
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("auth.json"),
+            .unwrap_or(AUTH_FILE_NAME),
         std::process::id()
     ));
     {
@@ -857,31 +861,28 @@ fn write_auth_store(auth_file: &Path, auth_store: &Value) -> Result<()> {
     Ok(())
 }
 
-fn xai_provider_mut(auth_store: &mut Value) -> Result<&mut serde_json::Map<String, Value>> {
-    auth_store
-        .pointer_mut("/providers/xai-oauth")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("No Hermes xAI OAuth credentials stored. Run `hermes model` and select xAI Grok OAuth."))
-}
-
 fn xai_access_token(auth_store: &Value) -> Result<String> {
     auth_store
-        .pointer("/providers/xai-oauth/tokens/access_token")
+        .pointer("/tokens/access_token")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("Hermes xAI OAuth state is missing access_token. Run `hermes model` to re-authenticate."))
+        .ok_or_else(|| {
+            anyhow!("xAI OAuth state is missing access_token. Run `x-search auth login` to re-authenticate.")
+        })
 }
 
 fn xai_refresh_token(auth_store: &Value) -> Result<String> {
     auth_store
-        .pointer("/providers/xai-oauth/tokens/refresh_token")
+        .pointer("/tokens/refresh_token")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("Hermes xAI OAuth state is missing refresh_token. Run `hermes model` to re-authenticate."))
+        .ok_or_else(|| {
+            anyhow!("xAI OAuth state is missing refresh_token. Run `x-search auth login` to re-authenticate.")
+        })
 }
 
 fn access_token_is_expiring(access_token: &str, skew_seconds: u64) -> bool {
@@ -1078,5 +1079,18 @@ mod tests {
             "opaque-token",
             XAI_REFRESH_SKEW_SECONDS
         ));
+    }
+
+    #[test]
+    fn reads_tokens_from_flat_auth_store() {
+        let store = json!({
+            "version": 1,
+            "tokens": {
+                "access_token": "access",
+                "refresh_token": "refresh"
+            }
+        });
+        assert_eq!(xai_access_token(&store).unwrap(), "access");
+        assert_eq!(xai_refresh_token(&store).unwrap(), "refresh");
     }
 }
