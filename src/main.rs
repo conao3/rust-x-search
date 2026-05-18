@@ -1,14 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{SecondsFormat, Utc};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
+use rand::RngCore;
 use serde::Serialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
@@ -16,13 +19,22 @@ const DEFAULT_MODEL: &str = "grok-4.3";
 const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_OAUTH_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
 const XAI_REFRESH_SKEW_SECONDS: u64 = 120;
+const XAI_OAUTH_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+const XAI_OAUTH_REDIRECT_HOST: &str = "127.0.0.1";
+const XAI_OAUTH_REDIRECT_PORT: u16 = 56121;
+const XAI_OAUTH_REDIRECT_PATH: &str = "/callback";
 
 #[derive(Debug, Parser)]
 #[command(name = "x-search")]
 #[command(about = "Search X through the xAI Responses API x_search tool")]
+#[command(args_conflicts_with_subcommands = true)]
+#[command(subcommand_precedence_over_arg = true)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Query or question to answer using X Search.
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+    #[arg(num_args = 1..)]
     query: Vec<String>,
 
     /// xAI model to call.
@@ -42,7 +54,7 @@ struct Args {
     api_key_env: String,
 
     /// Hermes home directory that contains auth.json. Defaults to HERMES_HOME or ~/.hermes.
-    #[arg(long, env = "HERMES_HOME")]
+    #[arg(long, env = "HERMES_HOME", global = true)]
     hermes_home: Option<PathBuf>,
 
     /// Restrict X Search to these handles. Repeat or comma-separate values.
@@ -85,6 +97,40 @@ struct Args {
     json: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Manage xAI OAuth credentials compatible with Hermes auth.json.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Sign in to xAI Grok OAuth and store credentials in Hermes auth.json.
+    Login(LoginArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Sign in to xAI Grok OAuth and store credentials in Hermes auth.json.
+    Login(LoginArgs),
+    /// Show whether xAI OAuth credentials are stored without printing tokens.
+    Status,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct LoginArgs {
+    /// Re-run the OAuth flow even when non-expiring credentials already exist.
+    #[arg(long)]
+    force: bool,
+
+    /// Print the authorization URL without trying to open a browser.
+    #[arg(long)]
+    no_browser: bool,
+
+    /// OAuth/login HTTP timeout in seconds. Callback wait uses at least 180 seconds.
+    #[arg(long, default_value_t = 20)]
+    timeout_seconds: u64,
+}
+
 #[derive(Clone, Debug, ValueEnum)]
 enum AuthMode {
     Auto,
@@ -109,6 +155,30 @@ struct ExtractedResponse {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    if let Some(command) = &args.command {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(args.timeout_seconds.max(20)))
+            .build()?;
+        return run_command(&args, command, &client).await;
+    }
+
+    run_search(args).await
+}
+
+async fn run_command(args: &Args, command: &Command, client: &reqwest::Client) -> Result<()> {
+    match command {
+        Command::Login(login_args) => login_xai_oauth(args, login_args, client).await,
+        Command::Auth { command } => match command {
+            AuthCommand::Login(login_args) => login_xai_oauth(args, login_args, client).await,
+            AuthCommand::Status => print_auth_status(args),
+        },
+    }
+}
+
+async fn run_search(args: Args) -> Result<()> {
+    if args.query.is_empty() {
+        bail!("missing query; pass a query or run `x-search auth login`");
+    }
     if !args.allowed_x_handles.is_empty() && !args.excluded_x_handles.is_empty() {
         bail!("--allow-handle and --exclude-handle cannot be used together");
     }
@@ -147,6 +217,394 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_auth_status(args: &Args) -> Result<()> {
+    let auth_file = auth_file_path(args)?;
+    if !auth_file.exists() {
+        println!("auth_file: {}", auth_file.display());
+        println!("xai_oauth: missing");
+        println!("access_token_expiring: false");
+        return Ok(());
+    }
+    let auth_store = read_auth_store(&auth_file)?;
+    let access = xai_access_token(&auth_store).is_ok();
+    let refresh = xai_refresh_token(&auth_store).is_ok();
+    let expiring = xai_access_token(&auth_store)
+        .map(|token| access_token_is_expiring(&token, XAI_REFRESH_SKEW_SECONDS))
+        .unwrap_or(false);
+    println!("auth_file: {}", auth_file.display());
+    println!(
+        "xai_oauth: {}",
+        if access && refresh {
+            "configured"
+        } else {
+            "missing"
+        }
+    );
+    println!("access_token_expiring: {expiring}");
+    Ok(())
+}
+
+async fn login_xai_oauth(
+    args: &Args,
+    login_args: &LoginArgs,
+    client: &reqwest::Client,
+) -> Result<()> {
+    let auth_file = auth_file_path(args)?;
+    if !login_args.force {
+        if let Ok(auth_store) = read_auth_store(&auth_file) {
+            if let Ok(access_token) = xai_access_token(&auth_store) {
+                if !access_token_is_expiring(&access_token, 60) {
+                    println!("Existing xAI OAuth credentials are already available.");
+                    println!("auth_file: {}", auth_file.display());
+                    println!("Run with --force to start a new OAuth login.");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let discovery = xai_oauth_discovery(client).await?;
+    let authorization_endpoint = discovery
+        .get("authorization_endpoint")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("xAI OIDC discovery response was missing authorization_endpoint"))?
+        .trim()
+        .to_string();
+    let token_endpoint = discovery
+        .get("token_endpoint")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("xAI OIDC discovery response was missing token_endpoint"))?
+        .trim()
+        .to_string();
+    validate_xai_endpoint(&authorization_endpoint)?;
+    validate_xai_endpoint(&token_endpoint)?;
+
+    let listener = bind_xai_callback_listener()?;
+    let actual_port = listener.local_addr()?.port();
+    let redirect_uri = format!(
+        "http://{}:{}{}",
+        XAI_OAUTH_REDIRECT_HOST, actual_port, XAI_OAUTH_REDIRECT_PATH
+    );
+    let code_verifier = oauth_pkce_code_verifier();
+    let code_challenge = oauth_pkce_code_challenge(&code_verifier);
+    let state = random_hex(16);
+    let nonce = random_hex(16);
+    let authorize_url = xai_oauth_authorize_url(
+        &authorization_endpoint,
+        &redirect_uri,
+        &code_challenge,
+        &state,
+        &nonce,
+    )?;
+
+    println!("Open this URL to authorize x-search with xAI:");
+    println!("{authorize_url}");
+    println!();
+    println!("Waiting for callback on {redirect_uri}");
+    println!("If this runs over SSH, forward the callback port to this machine.");
+
+    if !login_args.no_browser {
+        if webbrowser::open(&authorize_url).is_ok() {
+            println!("Browser opened for xAI authorization.");
+        } else {
+            println!("Could not open a browser automatically; use the URL above.");
+        }
+    }
+
+    let callback = wait_for_oauth_callback(
+        listener,
+        XAI_OAUTH_REDIRECT_PATH,
+        Duration::from_secs(login_args.timeout_seconds.max(20) * 9),
+    )?;
+
+    if let Some(error) = callback.error {
+        bail!(
+            "xAI authorization failed: {}",
+            callback.error_description.unwrap_or(error)
+        );
+    }
+    if callback.state.as_deref() != Some(state.as_str()) {
+        bail!("xAI authorization failed: state mismatch");
+    }
+    let code = callback
+        .code
+        .filter(|code| !code.trim().is_empty())
+        .ok_or_else(|| anyhow!("xAI authorization failed: missing authorization code"))?;
+
+    let token_payload = exchange_xai_oauth_code(
+        client,
+        &token_endpoint,
+        &code,
+        &redirect_uri,
+        &code_verifier,
+    )
+    .await?;
+
+    save_xai_oauth_login(
+        &auth_file,
+        token_payload,
+        json!({
+            "authorization_endpoint": authorization_endpoint,
+            "token_endpoint": token_endpoint,
+        }),
+        redirect_uri,
+    )?;
+
+    println!();
+    println!("Login successful!");
+    println!("auth_file: {}", auth_file.display());
+    println!("Tokens were saved under providers.xai-oauth without printing them.");
+    Ok(())
+}
+
+async fn xai_oauth_discovery(client: &reqwest::Client) -> Result<Value> {
+    let response = client
+        .get(XAI_OAUTH_DISCOVERY_URL)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .context("xAI OIDC discovery failed")?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .context("failed to parse xAI OIDC discovery response as JSON")?;
+    if !status.is_success() {
+        bail!("xAI OIDC discovery returned {status}");
+    }
+    Ok(value)
+}
+
+fn bind_xai_callback_listener() -> Result<TcpListener> {
+    TcpListener::bind((XAI_OAUTH_REDIRECT_HOST, XAI_OAUTH_REDIRECT_PORT))
+        .or_else(|_| TcpListener::bind((XAI_OAUTH_REDIRECT_HOST, 0)))
+        .context("failed to bind xAI OAuth callback listener")
+}
+
+#[derive(Default)]
+struct CallbackResult {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn wait_for_oauth_callback(
+    listener: TcpListener,
+    expected_path: &str,
+    timeout: Duration,
+) -> Result<CallbackResult> {
+    listener.set_nonblocking(true)?;
+    let deadline = Instant::now() + timeout.max(Duration::from_secs(30));
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _addr)) => {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 4096];
+                let size = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let first_line = request.lines().next().unwrap_or_default();
+                let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+                let result = parse_callback_path(path, expected_path);
+                let ok = result.as_ref().map(|r| r.error.is_none()).unwrap_or(false);
+                write_callback_response(&mut stream, ok)?;
+                if let Ok(result) = result {
+                    return Ok(result);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error).context("failed while waiting for OAuth callback"),
+        }
+    }
+    bail!("xAI authorization timed out waiting for the local callback")
+}
+
+fn parse_callback_path(path: &str, expected_path: &str) -> Result<CallbackResult> {
+    let url = Url::parse(&format!("http://127.0.0.1{path}"))?;
+    if url.path() != expected_path {
+        bail!("unexpected OAuth callback path: {}", url.path());
+    }
+    let mut result = CallbackResult::default();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => result.code = Some(value.into_owned()),
+            "state" => result.state = Some(value.into_owned()),
+            "error" => result.error = Some(value.into_owned()),
+            "error_description" => result.error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
+fn write_callback_response(stream: &mut std::net::TcpStream, ok: bool) -> Result<()> {
+    let body = if ok {
+        "<html><body><h1>x-search authorization received.</h1>You can close this tab.</body></html>"
+    } else {
+        "<html><body><h1>x-search authorization failed.</h1>You can close this tab.</body></html>"
+    };
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )?;
+    Ok(())
+}
+
+fn xai_oauth_authorize_url(
+    authorization_endpoint: &str,
+    redirect_uri: &str,
+    code_challenge: &str,
+    state: &str,
+    nonce: &str,
+) -> Result<String> {
+    let mut url = Url::parse(authorization_endpoint)?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", XAI_OAUTH_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", XAI_OAUTH_SCOPE)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state)
+        .append_pair("nonce", nonce)
+        .append_pair("plan", "generic")
+        .append_pair("referrer", "x-search");
+    Ok(url.to_string())
+}
+
+async fn exchange_xai_oauth_code(
+    client: &reqwest::Client,
+    token_endpoint: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> Result<Value> {
+    let body = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", XAI_OAUTH_CLIENT_ID),
+        ("code_verifier", code_verifier),
+    ])?;
+    let response = client
+        .post(token_endpoint)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body)
+        .send()
+        .await
+        .context("xAI token exchange failed")?;
+    let status = response.status();
+    let value: Value = response
+        .json()
+        .await
+        .context("failed to parse xAI token exchange response as JSON")?;
+    if !status.is_success() {
+        bail!("xAI token exchange failed with {status}");
+    }
+    if value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .is_none()
+    {
+        bail!("xAI token exchange did not return an access_token");
+    }
+    if value
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .is_none()
+    {
+        bail!("xAI token exchange did not return a refresh_token");
+    }
+    Ok(value)
+}
+
+fn save_xai_oauth_login(
+    auth_file: &Path,
+    token_payload: Value,
+    discovery: Value,
+    redirect_uri: String,
+) -> Result<()> {
+    let lock_path = auth_file.with_extension("lock");
+    if let Some(parent) = auth_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+
+    let mut auth_store = if auth_file.exists() {
+        read_auth_store(auth_file)?
+    } else {
+        json!({ "version": 1, "providers": {} })
+    };
+    if !auth_store.is_object() {
+        auth_store = json!({ "version": 1, "providers": {} });
+    }
+    if auth_store
+        .get("providers")
+        .and_then(Value::as_object)
+        .is_none()
+    {
+        auth_store["providers"] = json!({});
+    }
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    auth_store["version"] = json!(1);
+    auth_store["active_provider"] = json!("xai-oauth");
+    auth_store["updated_at"] = json!(now.clone());
+    auth_store["providers"]["xai-oauth"] = json!({
+        "auth_mode": "oauth_pkce",
+        "last_refresh": now,
+        "tokens": {
+            "access_token": token_payload.get("access_token").cloned().unwrap_or(Value::Null),
+            "refresh_token": token_payload.get("refresh_token").cloned().unwrap_or(Value::Null),
+            "id_token": token_payload.get("id_token").cloned().unwrap_or_else(|| json!("")),
+            "expires_in": token_payload.get("expires_in").cloned().unwrap_or(Value::Null),
+            "token_type": token_payload.get("token_type").cloned().unwrap_or_else(|| json!("Bearer")),
+        },
+        "discovery": discovery,
+        "redirect_uri": redirect_uri,
+    });
+    write_auth_store(auth_file, &auth_store)?;
+    Ok(())
+}
+
+fn oauth_pkce_code_verifier() -> String {
+    let mut bytes = [0_u8; 64];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn oauth_pkce_code_challenge(code_verifier: &str) -> String {
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn random_hex(byte_len: usize) -> String {
+    let mut bytes = vec![0_u8; byte_len];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn resolve_runtime_credentials(

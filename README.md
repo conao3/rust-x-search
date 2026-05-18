@@ -5,26 +5,54 @@
 By default it uses:
 
 1. `XAI_API_KEY`, when set.
-2. Hermes xAI OAuth credentials from `~/.hermes/auth.json`, when no API key is set.
+2. Hermes-compatible xAI OAuth credentials from `~/.hermes/auth.json`, when no API key is set.
 
-That means a machine already logged in through Hermes xAI OAuth can use `x-search` without copying an API key.
+The CLI can also run the xAI OAuth loopback login itself, so it does not require Hermes to be installed after setup.
 
 ## Requirements
 
 - Rust toolchain from the project Nix shell
 - Either:
   - `XAI_API_KEY` with access to the xAI Responses API and X Search tool, or
-  - an existing Hermes xAI OAuth login (`hermes model` → xAI Grok OAuth)
+  - xAI OAuth credentials created by `x-search auth login` or Hermes (`hermes model` → xAI Grok OAuth)
+
+## OAuth login
+
+Start or reuse an xAI Grok OAuth login:
+
+```sh
+nix develop -c cargo run -- auth login
+```
+
+On a remote machine, print the URL instead of opening a browser:
+
+```sh
+nix develop -c cargo run -- auth login --no-browser
+```
+
+Force a fresh OAuth flow even when credentials already exist:
+
+```sh
+nix develop -c cargo run -- auth login --force --no-browser
+```
+
+Check credential state without printing tokens:
+
+```sh
+nix develop -c cargo run -- auth status
+```
+
+OAuth state is written to `~/.hermes/auth.json` under `providers.xai-oauth`, matching the Hermes auth-store shape.
 
 ## Usage
 
-Use the existing Hermes xAI OAuth login:
+Use OAuth credentials from the auth store:
 
 ```sh
 nix develop -c cargo run -- "What are people saying about Hermes Agent on X?"
 ```
 
-Force Hermes OAuth explicitly:
+Force OAuth explicitly:
 
 ```sh
 nix develop -c cargo run -- --auth hermes-oauth "Hermes Agent"
@@ -52,9 +80,18 @@ The CLI sends a single Responses API request with:
 - tool: `x_search`
 - optional filters: `allowed_x_handles`, `excluded_x_handles`, `from_date`, `to_date`, `enable_image_understanding`, `enable_video_understanding`
 
-## Hermes OAuth behavior
+## OAuth behavior
 
-When using `--auth hermes-oauth` or the automatic Hermes fallback, the CLI:
+When using `x-search auth login`, the CLI mirrors Hermes' xAI OAuth loopback flow:
+
+- discovers xAI OAuth endpoints from `https://auth.x.ai/.well-known/openid-configuration`
+- starts a local callback listener on `127.0.0.1:56121/callback`, falling back to another local port if needed
+- uses PKCE (`S256`), state, and nonce
+- opens the authorization URL unless `--no-browser` is passed
+- exchanges the callback code for access and refresh tokens
+- writes the result to `~/.hermes/auth.json` with owner-only temp-file permissions on Unix
+
+When using `--auth hermes-oauth` or the automatic OAuth fallback, the CLI:
 
 - reads `xai-oauth` tokens from `~/.hermes/auth.json` or `--hermes-home`/`HERMES_HOME`
 - refreshes the access token when a JWT `exp` claim is within 120 seconds
