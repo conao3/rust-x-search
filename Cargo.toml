@@ -1,0 +1,15 @@
+[package]
+name = "x-search"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A small xAI X Search command-line client"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.98"
+clap = { version = "4.5.38", features = ["derive", "env", "wrap_help"] }
+reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.45.0", features = ["macros", "rt-multi-thread"] }
