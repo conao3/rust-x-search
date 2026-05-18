@@ -7,37 +7,54 @@ By default it uses:
 1. `XAI_API_KEY`, when set.
 2. xAI OAuth credentials from `~/.config/x-search/auth.json`, when no API key is set.
 
-## Requirements
+## Installation
 
-- Rust toolchain from the project Nix shell
-- Either:
-  - `XAI_API_KEY` with access to the xAI Responses API and X Search tool, or
-  - xAI OAuth credentials created by `x-search auth login`
+With `cargo`:
+
+```sh
+cargo install --git https://github.com/conao3/rust-x-search
+```
+
+With Nix (run the binary directly from the source tree):
+
+```sh
+nix shell github:conao3/rust-x-search
+```
+
+Or enter the project dev shell and build locally:
+
+```sh
+git clone https://github.com/conao3/rust-x-search
+cd rust-x-search
+nix develop -c cargo install --path .
+```
+
+After install, make sure `~/.cargo/bin` is on your `PATH` so `x-search` is found.
 
 ## OAuth login
 
 Start or reuse an xAI Grok OAuth login:
 
 ```sh
-nix develop -c cargo run -- auth login
+x-search auth login
 ```
 
 On a remote machine, print the URL instead of opening a browser:
 
 ```sh
-nix develop -c cargo run -- auth login --no-browser
+x-search auth login --no-browser
 ```
 
 Force a fresh OAuth flow even when credentials already exist:
 
 ```sh
-nix develop -c cargo run -- auth login --force --no-browser
+x-search auth login --force --no-browser
 ```
 
 Check credential state without printing tokens:
 
 ```sh
-nix develop -c cargo run -- auth status
+x-search auth status
 ```
 
 OAuth state is written to `~/.config/x-search/auth.json`. The location can be overridden with `--config-dir` or `X_SEARCH_CONFIG_DIR`; if neither is set, `$XDG_CONFIG_HOME/x-search` is used when `XDG_CONFIG_HOME` is set.
@@ -47,20 +64,20 @@ OAuth state is written to `~/.config/x-search/auth.json`. The location can be ov
 Use OAuth credentials from the auth store:
 
 ```sh
-nix develop -c cargo run -- "What are people saying about Hermes Agent on X?"
+x-search "What are people saying about Hermes Agent on X?"
 ```
 
 Force OAuth explicitly:
 
 ```sh
-nix develop -c cargo run -- --auth oauth "Hermes Agent"
+x-search --auth oauth "Hermes Agent"
 ```
 
 Use an API key explicitly:
 
 ```sh
 export XAI_API_KEY=...
-nix develop -c cargo run -- --auth api-key "Hermes Agent"
+x-search --auth api-key "Hermes Agent"
 ```
 
 Useful filters:
