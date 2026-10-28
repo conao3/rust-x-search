@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -579,7 +579,7 @@ fn save_xai_oauth_login(
 
 fn oauth_pkce_code_verifier() -> String {
     let mut bytes = [0_u8; 64];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -590,7 +590,7 @@ fn oauth_pkce_code_challenge(code_verifier: &str) -> String {
 
 fn random_hex(byte_len: usize) -> String {
     let mut bytes = vec![0_u8; byte_len];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

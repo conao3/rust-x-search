@@ -7,17 +7,17 @@ description = "A small xAI X Search command-line client"
 readme = "README.md"
 
 [dependencies]
-anyhow = "1.0.98"
-base64 = "0.22.1"
-chrono = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
-clap = { version = "4.5.38", features = ["derive", "env", "wrap_help"] }
+anyhow = "1.0.104"
+base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
 fs2 = "0.4.3"
-rand = "0.8.5"
-reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 serde_urlencoded = "0.7.1"
-sha2 = "0.10.9"
-tokio = { version = "1.45.0", features = ["macros", "rt-multi-thread"] }
-url = "2.5.4"
-webbrowser = "1.0.4"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+url = "2.5.8"
+webbrowser = "1.2.5"
