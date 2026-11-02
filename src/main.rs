@@ -1,8 +1,14 @@
+mod error;
+mod grammar;
+mod output;
+
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{SecondsFormat, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
+use grammar::{CliInputArgs, SkeletonKind};
+use output::{OutputFormat, Response};
 use rand::Rng;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -27,115 +33,158 @@ const DEFAULT_CONFIG_SUBDIR: &str = "x-search";
 const AUTH_FILE_NAME: &str = "auth.json";
 const AUTH_STORE_VERSION: u64 = 1;
 
-#[derive(Debug, Parser)]
-#[command(name = "x-search")]
-#[command(about = "Search X through the xAI Responses API x_search tool")]
-#[command(args_conflicts_with_subcommands = true)]
-#[command(subcommand_precedence_over_arg = true)]
-struct Args {
-    #[command(subcommand)]
-    command: Option<Command>,
+const DEFAULT_SYSTEM_PROMPT: &str = "Use X Search when useful. Answer directly, cite relevant X posts, and do not invent posts or metrics.";
 
-    /// Query or question to answer using X Search.
-    #[arg(num_args = 1..)]
-    query: Vec<String>,
-
-    /// xAI model to call.
-    #[arg(long, default_value = DEFAULT_MODEL)]
-    model: String,
-
-    /// xAI API base URL.
-    #[arg(long)]
-    base_url: Option<String>,
-
-    /// Authentication source. auto uses XAI_API_KEY first, then xAI OAuth.
-    #[arg(long, value_enum, default_value_t = AuthMode::Auto)]
-    auth: AuthMode,
-
-    /// Environment variable that contains the xAI API key.
-    #[arg(long, default_value = "XAI_API_KEY")]
-    api_key_env: String,
-
-    /// Directory that stores auth.json. Defaults to X_SEARCH_CONFIG_DIR,
-    /// XDG_CONFIG_HOME/x-search, or ~/.config/x-search.
-    #[arg(long, env = "X_SEARCH_CONFIG_DIR", global = true)]
-    config_dir: Option<PathBuf>,
-
-    /// Restrict X Search to these handles. Repeat or comma-separate values.
-    #[arg(long = "allow-handle", short = 'a', value_delimiter = ',')]
-    allowed_x_handles: Vec<String>,
-
-    /// Exclude these handles from X Search. Repeat or comma-separate values.
-    #[arg(long = "exclude-handle", short = 'x', value_delimiter = ',')]
-    excluded_x_handles: Vec<String>,
-
-    /// Start date for search range, in YYYY-MM-DD format.
-    #[arg(long)]
-    from_date: Option<String>,
-
-    /// End date for search range, in YYYY-MM-DD format.
-    #[arg(long)]
-    to_date: Option<String>,
-
-    /// Ask X Search to analyze images in posts.
-    #[arg(long)]
-    image_understanding: bool,
-
-    /// Ask X Search to analyze videos in posts.
-    #[arg(long)]
-    video_understanding: bool,
-
-    /// System prompt sent before the user query.
+#[derive(Parser)]
+#[command(
+    name = "x-search",
+    version,
+    about = "Search X through the xAI Responses API x_search tool"
+)]
+struct Cli {
+    /// Output format
+    #[arg(long, global = true, help_heading = "Global Options", value_enum, default_value_t = OutputFormat::Json)]
+    output: OutputFormat,
+    /// JMESPath expression applied to the output
     #[arg(
         long,
-        default_value = "Use X Search when useful. Answer directly, cite relevant X posts, and do not invent posts or metrics."
+        global = true,
+        help_heading = "Global Options",
+        value_name = "JMESPATH"
     )]
-    system: String,
+    query: Option<String>,
+    /// Print debug logs to stderr
+    #[arg(long, global = true, help_heading = "Global Options")]
+    debug: bool,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    /// HTTP timeout in seconds.
+#[derive(Subcommand)]
+enum Command {
+    /// Search X posts and answer a question with citations
+    #[command(subcommand)]
+    Post(PostCommand),
+    /// Manage the xAI OAuth credentials stored in the x-search auth store
+    #[command(subcommand)]
+    Auth(AuthCommand),
+}
+
+#[derive(Subcommand)]
+enum PostCommand {
+    /// Answer a query with the xAI Responses API x_search tool
+    #[command(name = "search-posts")]
+    SearchPosts(Box<SearchPostsArgs>),
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Sign in to xAI Grok OAuth (loopback callback) and store the credentials. Progress goes to stderr
+    #[command(name = "start-oauth-login")]
+    StartOauthLogin(StartOauthLoginArgs),
+    /// Show whether xAI OAuth credentials are stored, without printing tokens
+    #[command(name = "get-oauth-status")]
+    GetOauthStatus(GetOauthStatusArgs),
+}
+
+#[derive(Args)]
+struct ConfigArgs {
+    /// Directory that stores auth.json. Defaults to X_SEARCH_CONFIG_DIR, XDG_CONFIG_HOME/x-search, or ~/.config/x-search
+    #[arg(long, env = "X_SEARCH_CONFIG_DIR")]
+    config_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SearchPostsArgs {
+    /// Query or question to answer using X Search
+    #[arg(long, allow_hyphen_values = true)]
+    search_query: String,
+    /// xAI model to call
+    #[arg(long, default_value = DEFAULT_MODEL)]
+    model: String,
+    /// xAI API base URL (defaults to XAI_BASE_URL or https://api.x.ai/v1)
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Authentication source. auto uses the API key environment variable first, then xAI OAuth
+    #[arg(long, value_enum, default_value_t = AuthMode::Auto)]
+    auth: AuthMode,
+    /// Environment variable that contains the xAI API key
+    #[arg(long, default_value = "XAI_API_KEY")]
+    api_key_env: String,
+    #[command(flatten)]
+    config: ConfigArgs,
+    /// Restrict X Search to these handles (space-separated)
+    #[arg(long, num_args = 1.., conflicts_with = "excluded_handles")]
+    allowed_handles: Vec<String>,
+    /// Exclude these handles from X Search (space-separated)
+    #[arg(long, num_args = 1..)]
+    excluded_handles: Vec<String>,
+    /// Start date of the search range (YYYY-MM-DD)
+    #[arg(long)]
+    from_date: Option<String>,
+    /// End date of the search range (YYYY-MM-DD)
+    #[arg(long)]
+    to_date: Option<String>,
+    /// Ask X Search to analyze images in posts
+    #[arg(long, overrides_with = "no_image_understanding")]
+    image_understanding: bool,
+    /// Turn off --image-understanding
+    #[arg(long, overrides_with = "image_understanding")]
+    no_image_understanding: bool,
+    /// Ask X Search to analyze videos in posts
+    #[arg(long, overrides_with = "no_video_understanding")]
+    video_understanding: bool,
+    /// Turn off --video-understanding
+    #[arg(long, overrides_with = "video_understanding")]
+    no_video_understanding: bool,
+    /// System prompt sent before the user query
+    #[arg(long, allow_hyphen_values = true, default_value = DEFAULT_SYSTEM_PROMPT)]
+    system_prompt: String,
+    /// HTTP timeout in seconds
     #[arg(long, default_value_t = 120)]
     timeout_seconds: u64,
-
-    /// Print the full API response JSON.
-    #[arg(long)]
-    json: bool,
+    /// Add the full API response (keys converted to PascalCase) as Response
+    #[arg(long, overrides_with = "no_include_response")]
+    include_response: bool,
+    /// Turn off --include-response
+    #[arg(long, overrides_with = "include_response")]
+    no_include_response: bool,
+    #[command(flatten)]
+    input: CliInputArgs,
 }
 
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Manage xAI OAuth credentials stored in the x-search auth store.
-    Auth {
-        #[command(subcommand)]
-        command: AuthCommand,
-    },
-    /// Sign in to xAI Grok OAuth and store credentials in the x-search auth store.
-    Login(LoginArgs),
-}
-
-#[derive(Debug, Subcommand)]
-enum AuthCommand {
-    /// Sign in to xAI Grok OAuth and store credentials in the x-search auth store.
-    Login(LoginArgs),
-    /// Show whether xAI OAuth credentials are stored without printing tokens.
-    Status,
-}
-
-#[derive(Clone, Debug, Parser)]
-struct LoginArgs {
-    /// Re-run the OAuth flow even when non-expiring credentials already exist.
-    #[arg(long)]
+#[derive(Args)]
+struct StartOauthLoginArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+    /// Re-run the OAuth flow even when non-expiring credentials already exist
+    #[arg(long, overrides_with = "no_force")]
     force: bool,
-
-    /// Print the authorization URL without trying to open a browser.
+    /// Turn off --force
+    #[arg(long, overrides_with = "force")]
+    no_force: bool,
+    /// Open the authorization URL in a browser (on by default)
+    #[arg(long, default_value_t = true)]
+    open_browser: bool,
+    /// Only print the authorization URL to stderr
     #[arg(long)]
-    no_browser: bool,
-
-    /// OAuth/login HTTP timeout in seconds. Callback wait uses at least 180 seconds.
+    no_open_browser: bool,
+    /// OAuth HTTP timeout in seconds. The callback wait is nine times this, at least 180 seconds
     #[arg(long, default_value_t = 20)]
     timeout_seconds: u64,
+    #[command(flatten)]
+    input: CliInputArgs,
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Args)]
+struct GetOauthStatusArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+    #[command(flatten)]
+    input: CliInputArgs,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum AuthMode {
     Auto,
     ApiKey,
@@ -148,52 +197,209 @@ struct RuntimeCredentials {
     base_url: String,
 }
 
-#[derive(Debug, Serialize)]
-struct ExtractedResponse {
+#[derive(Debug)]
+struct ServiceError(String);
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
+fn service(message: String) -> anyhow::Error {
+    anyhow::Error::new(ServiceError(message))
+}
+
+macro_rules! service_bail {
+    ($($arg:tt)*) => {
+        return Err(service(format!($($arg)*)))
+    };
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct SearchPostsOutput {
     text: String,
-    citations: Vec<Value>,
-    raw: Value,
+    citations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response: Option<Value>,
+}
+
+#[derive(Serialize)]
+enum LoginResult {
+    LoggedIn,
+    AlreadyLoggedIn,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct StartOauthLoginOutput {
+    auth_file: String,
+    result: LoginResult,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct GetOauthStatusOutput {
+    auth_file: String,
+    oauth_configured: bool,
+    access_token_expiring: bool,
+}
+
+fn classify(error: anyhow::Error) -> error::Error {
+    let message = format!("{error:#}");
+    if error.chain().any(|cause| cause.is::<ServiceError>()) {
+        error::target(message)
+    } else {
+        error::other(message)
+    }
+}
+
+fn to_value<T: Serialize>(value: &T) -> error::Result<Value> {
+    serde_json::to_value(value).map_err(|error| error::other(error.to_string()))
+}
+
+fn output_skeleton(path: &[String]) -> error::Result<Value> {
+    match path.last().map(String::as_str) {
+        Some("search-posts") => to_value(&SearchPostsOutput {
+            text: String::new(),
+            citations: vec![String::new()],
+            response: Some(json!({})),
+        }),
+        Some("start-oauth-login") => to_value(&StartOauthLoginOutput {
+            auth_file: String::new(),
+            result: LoginResult::LoggedIn,
+        }),
+        Some("get-oauth-status") => to_value(&GetOauthStatusOutput {
+            auth_file: String::new(),
+            oauth_configured: false,
+            access_token_expiring: false,
+        }),
+        _ => Err(error::parameter(
+            "--generate-cli-skeleton needs a command and a subcommand",
+        )),
+    }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-
-    if let Some(command) = &args.command {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(args.timeout_seconds.max(20)))
-            .build()?;
-        return run_command(&args, command, &client).await;
-    }
-
-    run_search(args).await
+async fn main() {
+    let code = match run().await {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            error.exit_code()
+        }
+    };
+    std::process::exit(code);
 }
 
-async fn run_command(args: &Args, command: &Command, client: &reqwest::Client) -> Result<()> {
-    match command {
-        Command::Login(login_args) => login_xai_oauth(args, login_args, client).await,
-        Command::Auth { command } => match command {
-            AuthCommand::Login(login_args) => login_xai_oauth(args, login_args, client).await,
-            AuthCommand::Status => print_auth_status(args),
-        },
+async fn run() -> error::Result<()> {
+    let mut root = Cli::command();
+    root.build();
+    let prepared = grammar::prepare(&root, std::env::args_os().collect())?;
+    let debug = prepared.argv.iter().any(|token| token == "--debug");
+    if debug {
+        eprintln!("debug: argv {:?}", &prepared.argv[1..]);
     }
+
+    if let Some(kind) = prepared.skeleton {
+        let mut command = &root;
+        for name in &prepared.path {
+            command = command
+                .find_subcommand(name)
+                .ok_or_else(|| error::other(format!("unknown subcommand {name}")))?;
+        }
+        if command.has_subcommands() {
+            return Err(error::parameter(
+                "--generate-cli-skeleton needs a command and a subcommand",
+            ));
+        }
+        let value = match kind {
+            SkeletonKind::Input => grammar::input_skeleton(command),
+            SkeletonKind::Output => output_skeleton(&prepared.path)?,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|error| error::other(error.to_string()))?
+        );
+        return Ok(());
+    }
+
+    let cli = match Cli::try_parse_from(&prepared.argv) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = if error.use_stderr() { 252 } else { 0 };
+            let _ = error.print();
+            std::process::exit(code);
+        }
+    };
+
+    if let Some(query) = &cli.query {
+        output::compile_query(query)?;
+    }
+    let (name, response) = match cli.command {
+        Command::Post(PostCommand::SearchPosts(args)) => {
+            if args.search_query.trim().is_empty() {
+                return Err(error::parameter("--search-query must not be empty"));
+            }
+            let output = search_posts(&args, debug).await.map_err(classify)?;
+            let text = text_response(&output);
+            (
+                "search-posts",
+                Response {
+                    value: to_value(&output)?,
+                    text: Some(text),
+                },
+            )
+        }
+        Command::Auth(AuthCommand::StartOauthLogin(args)) => {
+            let output = start_oauth_login(&args).await.map_err(classify)?;
+            (
+                "start-oauth-login",
+                Response {
+                    value: to_value(&output)?,
+                    text: None,
+                },
+            )
+        }
+        Command::Auth(AuthCommand::GetOauthStatus(args)) => {
+            let output = get_oauth_status(&args.config).map_err(classify)?;
+            (
+                "get-oauth-status",
+                Response {
+                    value: to_value(&output)?,
+                    text: None,
+                },
+            )
+        }
+    };
+    print!(
+        "{}",
+        output::render(
+            &grammar::pascal_case(name),
+            response,
+            cli.output,
+            cli.query.as_deref()
+        )?
+    );
+    Ok(())
 }
 
-async fn run_search(args: Args) -> Result<()> {
-    if args.query.is_empty() {
-        bail!("missing query; pass a query or run `x-search auth login`");
-    }
-    if !args.allowed_x_handles.is_empty() && !args.excluded_x_handles.is_empty() {
-        bail!("--allow-handle and --exclude-handle cannot be used together");
-    }
-
+async fn search_posts(args: &SearchPostsArgs, debug: bool) -> Result<SearchPostsOutput> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.timeout_seconds))
         .build()?;
-    let credentials = resolve_runtime_credentials(&args, &client).await?;
+    let credentials = resolve_runtime_credentials(args, &client).await?;
 
-    let body = request_body(&args)?;
+    let body = request_body(args)?;
     let url = format!("{}/responses", credentials.base_url.trim_end_matches('/'));
+    if debug {
+        eprintln!("debug: POST {url}");
+        eprintln!("debug: request body {body}");
+    }
 
     let response = client
         .post(url)
@@ -201,87 +407,86 @@ async fn run_search(args: Args) -> Result<()> {
         .json(&body)
         .send()
         .await
-        .context("failed to send request to xAI")?;
+        .map_err(|e| service(format!("failed to send request to xAI: {e}")))?;
 
     let status = response.status();
     let value: Value = response
         .json()
         .await
-        .context("failed to parse xAI response as JSON")?;
+        .map_err(|e| service(format!("failed to parse xAI response as JSON: {e}")))?;
 
     if !status.is_success() {
-        bail!("xAI API returned {status}: {}", pretty_json(&value));
+        service_bail!("xAI API returned {status}: {}", pretty_json(&value));
     }
 
-    let extracted = extract_response(value);
-    if args.json {
-        println!("{}", pretty_json(&extracted.raw));
-    } else {
-        print_text_response(&extracted)?;
+    let (text, citations) = extract_response(&value);
+    if text.trim().is_empty() && !args.include_response {
+        service_bail!(
+            "response did not contain output text; rerun with --include-response to inspect the raw response"
+        );
     }
-
-    Ok(())
+    Ok(SearchPostsOutput {
+        text: text.trim().to_string(),
+        citations,
+        response: args.include_response.then(|| pascal_case_keys(value)),
+    })
 }
 
-fn print_auth_status(args: &Args) -> Result<()> {
-    let auth_file = auth_file_path(args)?;
+fn get_oauth_status(config: &ConfigArgs) -> Result<GetOauthStatusOutput> {
+    let auth_file = auth_file_path(config)?;
+    let mut output = GetOauthStatusOutput {
+        auth_file: auth_file.display().to_string(),
+        oauth_configured: false,
+        access_token_expiring: false,
+    };
     if !auth_file.exists() {
-        println!("auth_file: {}", auth_file.display());
-        println!("xai_oauth: missing");
-        println!("access_token_expiring: false");
-        return Ok(());
+        return Ok(output);
     }
     let auth_store = read_auth_store(&auth_file)?;
-    let access = xai_access_token(&auth_store).is_ok();
-    let refresh = xai_refresh_token(&auth_store).is_ok();
-    let expiring = xai_access_token(&auth_store)
+    output.oauth_configured =
+        xai_access_token(&auth_store).is_ok() && xai_refresh_token(&auth_store).is_ok();
+    output.access_token_expiring = xai_access_token(&auth_store)
         .map(|token| access_token_is_expiring(&token, XAI_REFRESH_SKEW_SECONDS))
         .unwrap_or(false);
-    println!("auth_file: {}", auth_file.display());
-    println!(
-        "xai_oauth: {}",
-        if access && refresh {
-            "configured"
-        } else {
-            "missing"
-        }
-    );
-    println!("access_token_expiring: {expiring}");
-    Ok(())
+    Ok(output)
 }
 
-async fn login_xai_oauth(
-    args: &Args,
-    login_args: &LoginArgs,
-    client: &reqwest::Client,
-) -> Result<()> {
-    let auth_file = auth_file_path(args)?;
+async fn start_oauth_login(login_args: &StartOauthLoginArgs) -> Result<StartOauthLoginOutput> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(login_args.timeout_seconds.max(20)))
+        .build()?;
+    let auth_file = auth_file_path(&login_args.config)?;
     if !login_args.force {
         if let Ok(auth_store) = read_auth_store(&auth_file) {
             if let Ok(access_token) = xai_access_token(&auth_store) {
                 if !access_token_is_expiring(&access_token, 60) {
-                    println!("Existing xAI OAuth credentials are already available.");
-                    println!("auth_file: {}", auth_file.display());
-                    println!("Run with --force to start a new OAuth login.");
-                    return Ok(());
+                    eprintln!("Existing xAI OAuth credentials are already available. Run with --force to start a new OAuth login.");
+                    return Ok(StartOauthLoginOutput {
+                        auth_file: auth_file.display().to_string(),
+                        result: LoginResult::AlreadyLoggedIn,
+                    });
                 }
             }
         }
     }
 
-    let discovery = xai_oauth_discovery(client).await?;
+    let discovery = xai_oauth_discovery(&client).await?;
     let authorization_endpoint = discovery
         .get("authorization_endpoint")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("xAI OIDC discovery response was missing authorization_endpoint"))?
+        .ok_or_else(|| {
+            service("xAI OIDC discovery response was missing authorization_endpoint".to_string())
+        })?
         .trim()
         .to_string();
     let token_endpoint = discovery
         .get("token_endpoint")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("xAI OIDC discovery response was missing token_endpoint"))?
+        .ok_or_else(|| {
+            service("xAI OIDC discovery response was missing token_endpoint".to_string())
+        })?
         .trim()
         .to_string();
     validate_xai_endpoint(&authorization_endpoint)?;
@@ -305,17 +510,17 @@ async fn login_xai_oauth(
         &nonce,
     )?;
 
-    println!("Open this URL to authorize x-search with xAI:");
-    println!("{authorize_url}");
-    println!();
-    println!("Waiting for callback on {redirect_uri}");
-    println!("If this runs over SSH, forward the callback port to this machine.");
+    eprintln!("Open this URL to authorize x-search with xAI:");
+    eprintln!("{authorize_url}");
+    eprintln!();
+    eprintln!("Waiting for callback on {redirect_uri}");
+    eprintln!("If this runs over SSH, forward the callback port to this machine.");
 
-    if !login_args.no_browser {
+    if login_args.open_browser && !login_args.no_open_browser {
         if webbrowser::open(&authorize_url).is_ok() {
-            println!("Browser opened for xAI authorization.");
+            eprintln!("Browser opened for xAI authorization.");
         } else {
-            println!("Could not open a browser automatically; use the URL above.");
+            eprintln!("Could not open a browser automatically; use the URL above.");
         }
     }
 
@@ -326,21 +531,23 @@ async fn login_xai_oauth(
     )?;
 
     if let Some(error) = callback.error {
-        bail!(
+        service_bail!(
             "xAI authorization failed: {}",
             callback.error_description.unwrap_or(error)
         );
     }
     if callback.state.as_deref() != Some(state.as_str()) {
-        bail!("xAI authorization failed: state mismatch");
+        service_bail!("xAI authorization failed: state mismatch");
     }
     let code = callback
         .code
         .filter(|code| !code.trim().is_empty())
-        .ok_or_else(|| anyhow!("xAI authorization failed: missing authorization code"))?;
+        .ok_or_else(|| {
+            service("xAI authorization failed: missing authorization code".to_string())
+        })?;
 
     let token_payload = exchange_xai_oauth_code(
-        client,
+        &client,
         &token_endpoint,
         &code,
         &redirect_uri,
@@ -358,11 +565,11 @@ async fn login_xai_oauth(
         redirect_uri,
     )?;
 
-    println!();
-    println!("Login successful!");
-    println!("auth_file: {}", auth_file.display());
-    println!("Tokens were saved without printing them.");
-    Ok(())
+    eprintln!("Login successful. Tokens were saved without printing them.");
+    Ok(StartOauthLoginOutput {
+        auth_file: auth_file.display().to_string(),
+        result: LoginResult::LoggedIn,
+    })
 }
 
 async fn xai_oauth_discovery(client: &reqwest::Client) -> Result<Value> {
@@ -371,14 +578,15 @@ async fn xai_oauth_discovery(client: &reqwest::Client) -> Result<Value> {
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .context("xAI OIDC discovery failed")?;
+        .map_err(|e| service(format!("xAI OIDC discovery failed: {e}")))?;
     let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .context("failed to parse xAI OIDC discovery response as JSON")?;
+    let value: Value = response.json().await.map_err(|e| {
+        service(format!(
+            "failed to parse xAI OIDC discovery response as JSON: {e}"
+        ))
+    })?;
     if !status.is_success() {
-        bail!("xAI OIDC discovery returned {status}");
+        service_bail!("xAI OIDC discovery returned {status}");
     }
     Ok(value)
 }
@@ -426,7 +634,7 @@ fn wait_for_oauth_callback(
             Err(error) => return Err(error).context("failed while waiting for OAuth callback"),
         }
     }
-    bail!("xAI authorization timed out waiting for the local callback")
+    service_bail!("xAI authorization timed out waiting for the local callback")
 }
 
 fn parse_callback_path(path: &str, expected_path: &str) -> Result<CallbackResult> {
@@ -508,14 +716,15 @@ async fn exchange_xai_oauth_code(
         .body(body)
         .send()
         .await
-        .context("xAI token exchange failed")?;
+        .map_err(|e| service(format!("xAI token exchange failed: {e}")))?;
     let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .context("failed to parse xAI token exchange response as JSON")?;
+    let value: Value = response.json().await.map_err(|e| {
+        service(format!(
+            "failed to parse xAI token exchange response as JSON: {e}"
+        ))
+    })?;
     if !status.is_success() {
-        bail!("xAI token exchange failed with {status}");
+        service_bail!("xAI token exchange failed with {status}");
     }
     if value
         .get("access_token")
@@ -523,7 +732,7 @@ async fn exchange_xai_oauth_code(
         .filter(|token| !token.trim().is_empty())
         .is_none()
     {
-        bail!("xAI token exchange did not return an access_token");
+        service_bail!("xAI token exchange did not return an access_token");
     }
     if value
         .get("refresh_token")
@@ -531,7 +740,7 @@ async fn exchange_xai_oauth_code(
         .filter(|token| !token.trim().is_empty())
         .is_none()
     {
-        bail!("xAI token exchange did not return a refresh_token");
+        service_bail!("xAI token exchange did not return a refresh_token");
     }
     Ok(value)
 }
@@ -595,7 +804,7 @@ fn random_hex(byte_len: usize) -> String {
 }
 
 async fn resolve_runtime_credentials(
-    args: &Args,
+    args: &SearchPostsArgs,
     client: &reqwest::Client,
 ) -> Result<RuntimeCredentials> {
     match args.auth {
@@ -611,7 +820,7 @@ async fn resolve_runtime_credentials(
     }
 }
 
-fn resolve_api_key_credentials(args: &Args) -> Result<RuntimeCredentials> {
+fn resolve_api_key_credentials(args: &SearchPostsArgs) -> Result<RuntimeCredentials> {
     let bearer_token = std::env::var(&args.api_key_env)
         .with_context(|| format!("{} is not set", args.api_key_env))?;
     Ok(RuntimeCredentials {
@@ -621,10 +830,10 @@ fn resolve_api_key_credentials(args: &Args) -> Result<RuntimeCredentials> {
 }
 
 async fn resolve_oauth_credentials(
-    args: &Args,
+    args: &SearchPostsArgs,
     client: &reqwest::Client,
 ) -> Result<RuntimeCredentials> {
-    let auth_file = auth_file_path(args)?;
+    let auth_file = auth_file_path(&args.config)?;
     let auth_store = read_auth_store(&auth_file)?;
     let access_token = xai_access_token(&auth_store)?;
 
@@ -681,14 +890,15 @@ async fn refresh_xai_oauth_tokens(auth_file: &Path, client: &reqwest::Client) ->
         .body(body)
         .send()
         .await
-        .context("failed to refresh xAI OAuth token")?;
+        .map_err(|e| service(format!("failed to refresh xAI OAuth token: {e}")))?;
     let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .context("failed to parse xAI token refresh response as JSON")?;
+    let value: Value = response.json().await.map_err(|e| {
+        service(format!(
+            "failed to parse xAI token refresh response as JSON: {e}"
+        ))
+    })?;
     if !status.is_success() {
-        bail!("xAI OAuth token refresh failed with {status}");
+        service_bail!("xAI OAuth token refresh failed with {status}");
     }
 
     let root = auth_store
@@ -748,14 +958,15 @@ async fn token_endpoint(auth_store: &Value, client: &reqwest::Client) -> Result<
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .context("xAI OIDC discovery failed")?;
+        .map_err(|e| service(format!("xAI OIDC discovery failed: {e}")))?;
     let status = response.status();
-    let value: Value = response
-        .json()
-        .await
-        .context("failed to parse xAI OIDC discovery response as JSON")?;
+    let value: Value = response.json().await.map_err(|e| {
+        service(format!(
+            "failed to parse xAI OIDC discovery response as JSON: {e}"
+        ))
+    })?;
     if !status.is_success() {
-        bail!("xAI OIDC discovery returned {status}");
+        service_bail!("xAI OIDC discovery returned {status}");
     }
     let endpoint = value
         .get("token_endpoint")
@@ -765,7 +976,7 @@ async fn token_endpoint(auth_store: &Value, client: &reqwest::Client) -> Result<
     Ok(endpoint.trim().to_string())
 }
 
-fn selected_base_url(args: &Args) -> String {
+fn selected_base_url(args: &SearchPostsArgs) -> String {
     args.base_url
         .as_deref()
         .map(str::trim)
@@ -780,8 +991,8 @@ fn selected_base_url(args: &Args) -> String {
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
-fn auth_file_path(args: &Args) -> Result<PathBuf> {
-    let config_dir = args
+fn auth_file_path(config: &ConfigArgs) -> Result<PathBuf> {
+    let config_dir = config
         .config_dir
         .clone()
         .or_else(|| {
@@ -916,23 +1127,23 @@ fn validate_xai_endpoint(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-fn request_body(args: &Args) -> Result<Value> {
-    let query = args.query.join(" ");
+fn request_body(args: &SearchPostsArgs) -> Result<Value> {
+    let query = args.search_query.as_str();
     let mut tool = json!({ "type": "x_search" });
     let tool_obj = tool
         .as_object_mut()
         .ok_or_else(|| anyhow!("internal error: tool is not an object"))?;
 
-    if !args.allowed_x_handles.is_empty() {
+    if !args.allowed_handles.is_empty() {
         tool_obj.insert(
             "allowed_x_handles".to_string(),
-            json!(normalize_handles(&args.allowed_x_handles)),
+            json!(normalize_handles(&args.allowed_handles)),
         );
     }
-    if !args.excluded_x_handles.is_empty() {
+    if !args.excluded_handles.is_empty() {
         tool_obj.insert(
             "excluded_x_handles".to_string(),
-            json!(normalize_handles(&args.excluded_x_handles)),
+            json!(normalize_handles(&args.excluded_handles)),
         );
     }
     if let Some(from_date) = &args.from_date {
@@ -951,7 +1162,7 @@ fn request_body(args: &Args) -> Result<Value> {
     Ok(json!({
         "model": args.model,
         "input": [
-            { "role": "system", "content": args.system },
+            { "role": "system", "content": args.system_prompt },
             { "role": "user", "content": query }
         ],
         "tools": [tool]
@@ -966,7 +1177,7 @@ fn normalize_handles(handles: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn extract_response(raw: Value) -> ExtractedResponse {
+fn extract_response(raw: &Value) -> (String, Vec<String>) {
     let text = raw
         .get("output_text")
         .and_then(Value::as_str)
@@ -977,14 +1188,22 @@ fn extract_response(raw: Value) -> ExtractedResponse {
     let citations = raw
         .get("citations")
         .and_then(Value::as_array)
-        .cloned()
+        .map(|citations| {
+            citations
+                .iter()
+                .map(|citation| match citation {
+                    Value::String(url) => url.clone(),
+                    other => other
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| other.to_string()),
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
-    ExtractedResponse {
-        text,
-        citations,
-        raw,
-    }
+    (text, citations)
 }
 
 fn extract_text_from_output(output: Option<&Value>) -> Option<String> {
@@ -1010,27 +1229,39 @@ fn extract_text_from_output(output: Option<&Value>) -> Option<String> {
     }
 }
 
-fn print_text_response(response: &ExtractedResponse) -> Result<()> {
-    if response.text.trim().is_empty() {
-        bail!(
-            "response did not contain output text; rerun with --json to inspect the raw response"
-        );
-    }
-
-    println!("{}", response.text.trim());
-
-    if !response.citations.is_empty() {
-        println!("\nCitations:");
-        for citation in &response.citations {
-            if let Some(url) = citation.get("url").and_then(Value::as_str) {
-                println!("- {url}");
-            } else {
-                println!("- {}", citation);
-            }
+fn text_response(output: &SearchPostsOutput) -> String {
+    let mut text = format!("{}\n", output.text);
+    if !output.citations.is_empty() {
+        text.push_str("\nCitations:\n");
+        for citation in &output.citations {
+            text.push_str(&format!("- {citation}\n"));
         }
     }
+    text
+}
 
-    Ok(())
+fn pascal_case_key(key: &str) -> String {
+    key.split(['_', '-'])
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+fn pascal_case_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (pascal_case_key(&key), pascal_case_keys(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(pascal_case_keys).collect()),
+        value => value,
+    }
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -1050,7 +1281,7 @@ mod tests {
     #[test]
     fn extracts_output_text() {
         let value = json!({ "output_text": "hello" });
-        assert_eq!(extract_response(value).text, "hello");
+        assert_eq!(extract_response(&value).0, "hello");
     }
 
     #[test]
@@ -1063,7 +1294,7 @@ mod tests {
                 ]}
             ]
         });
-        assert_eq!(extract_response(value).text, "hello\nworld");
+        assert_eq!(extract_response(&value).0, "hello\nworld");
     }
 
     #[test]
@@ -1092,5 +1323,27 @@ mod tests {
         });
         assert_eq!(xai_access_token(&store).unwrap(), "access");
         assert_eq!(xai_refresh_token(&store).unwrap(), "refresh");
+    }
+
+    #[test]
+    fn parser_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn extracts_citation_urls() {
+        let value = json!({ "citations": ["https://x.com/a/status/1", { "url": "https://x.com/b/status/2" }] });
+        assert_eq!(
+            extract_response(&value).1,
+            vec!["https://x.com/a/status/1", "https://x.com/b/status/2"]
+        );
+    }
+
+    #[test]
+    fn converts_response_keys_to_pascal_case() {
+        assert_eq!(
+            pascal_case_keys(json!({ "output_text": "a", "usage": { "input_tokens": 1 } })),
+            json!({ "OutputText": "a", "Usage": { "InputTokens": 1 } })
+        );
     }
 }
