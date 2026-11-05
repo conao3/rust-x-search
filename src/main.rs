@@ -7,7 +7,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{SecondsFormat, Utc};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
-use grammar::{CliInputArgs, SkeletonKind};
 use output::{OutputFormat, Response};
 use rand::Rng;
 use serde::Serialize;
@@ -45,14 +44,6 @@ struct Cli {
     /// Output format
     #[arg(long, global = true, help_heading = "Global Options", value_enum, default_value_t = OutputFormat::Json)]
     output: OutputFormat,
-    /// JMESPath expression applied to the output
-    #[arg(
-        long,
-        global = true,
-        help_heading = "Global Options",
-        value_name = "JMESPATH"
-    )]
-    query: Option<String>,
     /// Print debug logs to stderr
     #[arg(long, global = true, help_heading = "Global Options")]
     debug: bool,
@@ -98,7 +89,7 @@ struct ConfigArgs {
 struct SearchPostsArgs {
     /// Query or question to answer using X Search
     #[arg(long, allow_hyphen_values = true)]
-    search_query: String,
+    query: String,
     /// xAI model to call
     #[arg(long, default_value = DEFAULT_MODEL)]
     model: String,
@@ -149,8 +140,6 @@ struct SearchPostsArgs {
     /// Turn off --include-response
     #[arg(long, overrides_with = "include_response")]
     no_include_response: bool,
-    #[command(flatten)]
-    input: CliInputArgs,
 }
 
 #[derive(Args)]
@@ -172,16 +161,12 @@ struct StartOauthLoginArgs {
     /// OAuth HTTP timeout in seconds. The callback wait is nine times this, at least 180 seconds
     #[arg(long, default_value_t = 20)]
     timeout_seconds: u64,
-    #[command(flatten)]
-    input: CliInputArgs,
 }
 
 #[derive(Args)]
 struct GetOauthStatusArgs {
     #[command(flatten)]
     config: ConfigArgs,
-    #[command(flatten)]
-    input: CliInputArgs,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -261,28 +246,6 @@ fn to_value<T: Serialize>(value: &T) -> error::Result<Value> {
     serde_json::to_value(value).map_err(|error| error::other(error.to_string()))
 }
 
-fn output_skeleton(path: &[String]) -> error::Result<Value> {
-    match path.last().map(String::as_str) {
-        Some("search-posts") => to_value(&SearchPostsOutput {
-            text: String::new(),
-            citations: vec![String::new()],
-            response: Some(json!({})),
-        }),
-        Some("start-oauth-login") => to_value(&StartOauthLoginOutput {
-            auth_file: String::new(),
-            result: LoginResult::LoggedIn,
-        }),
-        Some("get-oauth-status") => to_value(&GetOauthStatusOutput {
-            auth_file: String::new(),
-            oauth_configured: false,
-            access_token_expiring: false,
-        }),
-        _ => Err(error::parameter(
-            "--generate-cli-skeleton needs a command and a subcommand",
-        )),
-    }
-}
-
 #[tokio::main]
 async fn main() {
     let code = match run().await {
@@ -298,37 +261,13 @@ async fn main() {
 async fn run() -> error::Result<()> {
     let mut root = Cli::command();
     root.build();
-    let prepared = grammar::prepare(&root, std::env::args_os().collect())?;
-    let debug = prepared.argv.iter().any(|token| token == "--debug");
+    let argv = grammar::prepare(&root, std::env::args_os().collect())?;
+    let debug = argv.iter().any(|token| token == "--debug");
     if debug {
-        eprintln!("debug: argv {:?}", &prepared.argv[1..]);
+        eprintln!("debug: argv {:?}", &argv[1..]);
     }
 
-    if let Some(kind) = prepared.skeleton {
-        let mut command = &root;
-        for name in &prepared.path {
-            command = command
-                .find_subcommand(name)
-                .ok_or_else(|| error::other(format!("unknown subcommand {name}")))?;
-        }
-        if command.has_subcommands() {
-            return Err(error::parameter(
-                "--generate-cli-skeleton needs a command and a subcommand",
-            ));
-        }
-        let value = match kind {
-            SkeletonKind::Input => grammar::input_skeleton(command),
-            SkeletonKind::Output => output_skeleton(&prepared.path)?,
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value)
-                .map_err(|error| error::other(error.to_string()))?
-        );
-        return Ok(());
-    }
-
-    let cli = match Cli::try_parse_from(&prepared.argv) {
+    let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(error) => {
             let code = if error.use_stderr() { 252 } else { 0 };
@@ -337,13 +276,10 @@ async fn run() -> error::Result<()> {
         }
     };
 
-    if let Some(query) = &cli.query {
-        output::compile_query(query)?;
-    }
     let (name, response) = match cli.command {
         Command::Post(PostCommand::SearchPosts(args)) => {
-            if args.search_query.trim().is_empty() {
-                return Err(error::parameter("--search-query must not be empty"));
+            if args.query.trim().is_empty() {
+                return Err(error::parameter("--query must not be empty"));
             }
             let output = search_posts(&args, debug).await.map_err(classify)?;
             let text = text_response(&output);
@@ -378,12 +314,7 @@ async fn run() -> error::Result<()> {
     };
     print!(
         "{}",
-        output::render(
-            &grammar::pascal_case(name),
-            response,
-            cli.output,
-            cli.query.as_deref()
-        )?
+        output::render(&grammar::pascal_case(name), response, cli.output)?
     );
     Ok(())
 }
@@ -1128,7 +1059,7 @@ fn validate_xai_endpoint(endpoint: &str) -> Result<()> {
 }
 
 fn request_body(args: &SearchPostsArgs) -> Result<Value> {
-    let query = args.search_query.as_str();
+    let query = args.query.as_str();
     let mut tool = json!({ "type": "x_search" });
     let tool_obj = tool
         .as_object_mut()

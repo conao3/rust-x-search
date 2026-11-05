@@ -36,8 +36,7 @@ After install, make sure `~/.cargo/bin` is on your `PATH` so `x-search` is found
 Commands follow the AWS CLI grammar: `x-search [global options] <command> <subcommand> [--parameter value ...]`.
 
 - Every parameter is named. Lists are space-separated (`--allowed-handles xai grok`). Booleans come in pairs (`--image-understanding` / `--no-image-understanding`). A value starting with `file://` is read from that file, and `file:///dev/stdin` reads standard input.
-- `--cli-input-json file://input.json` passes the parameters as a JSON object keyed by the PascalCase parameter names; parameters on the command line take precedence. `--generate-cli-skeleton input|output` prints the input or output skeleton.
-- Global options: `--output json|text|table` (default `json`), `--query <JMESPath>`, `--debug`, `--version`.
+- Global options: `--output json|text|table` (default `json`), `--debug`, `--version`.
 - `help` works at every level: `x-search help`, `x-search post help`, `x-search post search-posts help`.
 - Output keys are PascalCase.
 - Exit codes: 0 success, 252 invalid command or parameter, 254 xAI returned an error or could not be reached (search, OAuth discovery, token exchange or refresh, authorization callback), 255 other failures such as missing credentials.
@@ -79,32 +78,32 @@ OAuth state is written to `~/.config/x-search/auth.json`. The location can be ov
 Use OAuth credentials from the auth store:
 
 ```sh
-x-search post search-posts --search-query "What are people saying about Hermes Agent on X?"
+x-search post search-posts --query "What are people saying about Hermes Agent on X?"
 ```
 
 Force OAuth explicitly:
 
 ```sh
-x-search post search-posts --auth oauth --search-query "Hermes Agent"
+x-search post search-posts --auth oauth --query "Hermes Agent"
 ```
 
 Use an API key explicitly:
 
 ```sh
 export XAI_API_KEY=...
-x-search post search-posts --auth api-key --search-query "Hermes Agent"
+x-search post search-posts --auth api-key --query "Hermes Agent"
 ```
 
 Useful filters:
 
 ```sh
-x-search post search-posts --allowed-handles xai --from-date 2026-05-01 --search-query "Hermes Agent"
-x-search post search-posts --excluded-handles elonmusk --search-query "xAI news"
-x-search post search-posts --image-understanding --search-query "AI posts with screenshots"
-x-search post search-posts --include-response --search-query "What are people saying about xAI?"
+x-search post search-posts --allowed-handles xai --from-date 2026-05-01 --query "Hermes Agent"
+x-search post search-posts --excluded-handles elonmusk --query "xAI news"
+x-search post search-posts --image-understanding --query "AI posts with screenshots"
+x-search post search-posts --include-response --query "What are people saying about xAI?"
 ```
 
-The output is `{"Text": "...", "Citations": ["https://x.com/..."]}`; `--include-response` adds the full API response (keys converted to PascalCase) as `Response`. `--output text` prints the answer followed by a `Citations:` list, and `--query Text --output text` prints only the answer.
+The output is `{"Text": "...", "Citations": ["https://x.com/..."]}`; `--include-response` adds the full API response (keys converted to PascalCase) as `Response`. `--output text` prints the answer followed by a `Citations:` list; pipe the JSON into `jq -r .Text` to print only the answer.
 
 The CLI sends a single Responses API request with:
 

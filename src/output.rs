@@ -2,7 +2,7 @@ use clap::ValueEnum;
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
-use crate::error::{other, parameter, Result};
+use crate::error::{other, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -16,16 +16,8 @@ pub struct Response {
     pub text: Option<String>,
 }
 
-pub fn render(
-    title: &str,
-    response: Response,
-    format: OutputFormat,
-    query: Option<&str>,
-) -> Result<String> {
-    let value = match query {
-        Some(expression) => search(expression, response.value)?,
-        None => response.value,
-    };
+pub fn render(title: &str, response: Response, format: OutputFormat) -> Result<String> {
+    let value = response.value;
     Ok(match format {
         OutputFormat::Json => {
             let mut out =
@@ -33,9 +25,9 @@ pub fn render(
             out.push('\n');
             out
         }
-        OutputFormat::Text => match (query, response.text) {
-            (None, Some(text)) => text,
-            _ => {
+        OutputFormat::Text => match response.text {
+            Some(text) => text,
+            None => {
                 let mut out = String::new();
                 text(&value, None, &mut out);
                 out
@@ -47,18 +39,6 @@ pub fn render(
             out
         }
     })
-}
-
-pub fn compile_query(expression: &str) -> Result<jmespath::Expression<'static>> {
-    jmespath::compile(expression)
-        .map_err(|error| parameter(format!("Bad value for --query {expression}: {error}")))
-}
-
-fn search(expression: &str, value: Value) -> Result<Value> {
-    let result = compile_query(expression)?
-        .search(value)
-        .map_err(|error| parameter(format!("--query {expression}: {error}")))?;
-    serde_json::to_value(&*result).map_err(|error| other(error.to_string()))
 }
 
 fn scalar(value: &Value) -> String {
@@ -228,18 +208,6 @@ mod tests {
         assert_eq!(
             out,
             "email\tFalse\nATTACHMENTS\ta.pdf\t3\nTO\ta@example.com\tb@example.com\n"
-        );
-    }
-
-    #[test]
-    fn query_selects_a_field() {
-        let response = Response {
-            value: json!({"ContentSha256": "abc", "Sealed": true}),
-            text: None,
-        };
-        assert_eq!(
-            render("X", response, OutputFormat::Text, Some("ContentSha256")).unwrap(),
-            "abc\n"
         );
     }
 
