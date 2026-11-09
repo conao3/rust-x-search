@@ -21,4 +21,4 @@ sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
 url = "2.5.8"
 unicode-width = "0.2.3"
-webbrowser = "1.2.5"
+webbrowser = "1.2.6"
